@@ -5,6 +5,7 @@ import sys
 
 import pytest
 
+from . import pgpass_support
 from .pgpass_support import (
     FILE_STATES,
     UiServer,
@@ -18,6 +19,13 @@ INSTANCES = '{"action":"instances"}'
 DATABASES = '{"action":"databases","instance":"t"}'
 TABLES_APP = '{"action":"tables","instance":"t","db":"app"}'
 ROWS = '{"action":"rows","instance":"t","db":"app","schema":"public","table":"notes"}'
+
+
+def test_ui_requires_opener_marker(pg0_home, monkeypatch):
+    prepare = pgpass_support._prepare_openers
+    monkeypatch.setattr(pgpass_support, "_prepare_openers", lambda path: prepare(path, inert=True))
+    with pytest.raises(AssertionError, match="browser opener stand-in did not write its marker"):
+        UiServer(pg0_home)
 
 
 @pytest.fixture

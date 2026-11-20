@@ -33,6 +33,51 @@ START_TIMEOUT = 180
 CLI_TIMEOUT = 60
 PROBE_TIMEOUT = 30
 UI_TIMEOUT = 60
+OPENER_TIMEOUT = 5
+
+_WINDOWS_OPENER = '''
+using System;
+using System.IO;
+public class TestOpener {
+    public static void Main() {
+        File.WriteAllText(Environment.GetEnvironmentVariable("PG0_TEST_OPENER_MARKER"), "opened");
+    }
+}
+'''
+
+
+def _prepare_openers(fake_bin, inert=False):
+    if sys.platform == "win32":
+        opener = fake_bin / "rundll32.exe"
+        if inert:
+            system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+            shutil.copy2(system32 / "whoami.exe", opener)
+        else:
+            env = dict(os.environ, PG0_TEST_OPENER_EXE=str(opener))
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                 "Add-Type -TypeDefinition ([Console]::In.ReadToEnd()) "
+                 "-OutputAssembly $env:PG0_TEST_OPENER_EXE -OutputType ConsoleApplication"],
+                input=_WINDOWS_OPENER, text=True, capture_output=True, env=env, timeout=CLI_TIMEOUT,
+            )
+            assert result.returncode == 0 and opener.is_file(), (
+                f"Could not compile the Windows opener fixture with PowerShell Add-Type: {result.stderr}"
+            )
+    else:
+        for name in ("open", "xdg-open"):
+            script = fake_bin / name
+            script.write_text('#!/bin/sh\n' + ('exit 0\n' if inert else
+                              'printf opened > "$PG0_TEST_OPENER_MARKER"\n'))
+            script.chmod(0o755)
+
+
+def _wait_for_opener(marker, timeout=OPENER_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if marker.is_file() and marker.read_text() == "opened":
+            return
+        time.sleep(0.05)
+    raise AssertionError("The browser opener stand-in did not write its marker")
 
 
 class Run:
@@ -591,25 +636,19 @@ class UiServer:
     LINK = re.compile(r":(\d+)/#token=(\S+)")
 
     def __init__(self, home, pgpassfile=None):
-        fake_bin = home.root / "bin"
-        fake_bin.mkdir(exist_ok=True)
+        fake_bin = Path(tempfile.mkdtemp(prefix="ui-opener-", dir=home.root))
         executable = pg0._find_pg0()
         extra = {}
         if sys.platform == "win32":
-            # Windows resolves rundll32 from the folder of the running executable before System32,
-            # so pg0 runs from a copy beside a stand-in rundll32 that only prints an error and exits.
+            # Windows searches the executable's folder before System32.
             executable = str(shutil.copy2(executable, fake_bin / "pg0.exe"))
-            system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
-            shutil.copy2(system32 / "whoami.exe", fake_bin / "rundll32.exe")
             # Its own process group lets stop() send Ctrl-Break to pg0 ui alone.
             extra = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        else:
-            for name in ("open", "xdg-open"):
-                script = fake_bin / name
-                script.write_text("#!/bin/sh\nexit 0\n")
-                script.chmod(0o755)
+        _prepare_openers(fake_bin)
+        marker = fake_bin / "opener.marker"
         env = home.env(pgpassfile)
         env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+        env["PG0_TEST_OPENER_MARKER"] = str(marker)
         self._home = home
         self._out = open(home.capture / "ui.stdout", "w+b")
         self._err = open(home.capture / "ui.stderr", "w+b")
@@ -619,6 +658,7 @@ class UiServer:
         )
         home.ui_servers.append(self)
         self.port, self.token = self._wait_for_link()
+        _wait_for_opener(marker)
 
     def _text(self, handle):
         handle.flush()
